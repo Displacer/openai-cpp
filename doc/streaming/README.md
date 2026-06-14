@@ -81,10 +81,12 @@ non-streaming `create()` call. The resulting `choices[0].message.*` is
 equivalent to what `create()` would return for the same request. The
 practical differences are:
 
-- Top-level response fields that the server only sends with the final
-  non-streaming reply (`id`, `created`, `model`, `usage`,
-  `system_fingerprint`, ...) are **not** present on the aggregated object —
-  the streaming protocol does not include them.
+- Top-level response fields that the server sends on streamed chunks
+  (`id`, `created`, `model`, `usage`, `system_fingerprint`, and provider-
+  specific fields such as Perplexity Sonar's `citations` / `search_results`)
+  are forwarded into the aggregated object on a **last non-null value wins**
+  basis. Fields that the server only emits with the final non-streaming
+  reply and never includes in any streamed chunk will still be absent.
 - Only `choices[0]` is aggregated. If you request `n > 1`, the additional
   choices are still delivered to `on_chunk` as they arrive, but they will
   not appear in the returned aggregated JSON.

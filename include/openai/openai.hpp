@@ -1060,6 +1060,20 @@ inline Json CategoryChat::createStream(Json input, std::function<bool(const Json
 
         if (!on_chunk(chunk)) return false;
 
+        // Forward top-level chunk fields (other than choices/error/object) into the
+        // aggregated final response, last non-null value wins. This preserves things
+        // like Perplexity Sonar's "citations" / "search_results" as well as OpenAI's
+        // "id", "model", "created", "usage", "system_fingerprint" which typically
+        // appear on the final chunk.
+        if (chunk.is_object()) {
+            for (auto it = chunk.begin(); it != chunk.end(); ++it) {
+                const auto& key = it.key();
+                if (key == "choices" || key == "object" || key == "error") continue;
+                if (it.value().is_null()) continue;
+                final_response[key] = it.value();
+            }
+        }
+
         if (!chunk.contains("choices") || !chunk["choices"].is_array() || chunk["choices"].empty()) {
             return true;
         }
