@@ -36,6 +36,7 @@
 #include <mutex>
 #include <cstdlib>
 #include <map>
+#include <functional>
 
 #ifndef CURL_STATICLIB
 #include <curl/curl.h>
@@ -114,12 +115,72 @@ public:
     Response postPrepare(const std::string& contentType = "");
     Response deletePrepare();
     Response makeRequest(const std::string& contentType = "");
+    Response makeStreamRequest(std::function<bool(const std::string&)> on_sse_event,
+                               const std::string& contentType = "application/json");
     std::string easyEscape(const std::string& text);
 
 private:
     static size_t writeFunction(void* ptr, size_t size, size_t nmemb, std::string* data) {
         data->append((char*) ptr, size * nmemb);
         return size * nmemb;
+    }
+
+    struct StreamCtx {
+        std::function<bool(const std::string&)> on_sse_event;
+        std::string buffer;
+        bool aborted = false;
+    };
+
+    static size_t writeStreamFunction(void* ptr, size_t size, size_t nmemb, void* userdata) {
+        size_t total = size * nmemb;
+        StreamCtx* ctx = static_cast<StreamCtx*>(userdata);
+        if (ctx->aborted) {
+            return 0; // abort transfer
+        }
+        ctx->buffer.append((char*)ptr, total);
+
+        // SSE events are separated by \n\n (or \r\n\r\n). Process all complete events.
+        while (true) {
+            size_t sep = ctx->buffer.find("\n\n");
+            size_t sep_len = 2;
+            if (sep == std::string::npos) {
+                size_t rsep = ctx->buffer.find("\r\n\r\n");
+                if (rsep == std::string::npos) break;
+                sep = rsep;
+                sep_len = 4;
+            }
+            std::string event = ctx->buffer.substr(0, sep);
+            ctx->buffer.erase(0, sep + sep_len);
+
+            // An event may contain multiple lines; collect all data: lines.
+            std::string data_payload;
+            size_t pos = 0;
+            while (pos < event.size()) {
+                size_t eol = event.find('\n', pos);
+                std::string line = (eol == std::string::npos)
+                                       ? event.substr(pos)
+                                       : event.substr(pos, eol - pos);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.rfind("data:", 0) == 0) {
+                    std::string v = line.substr(5);
+                    if (!v.empty() && v.front() == ' ') v.erase(0, 1);
+                    if (!data_payload.empty()) data_payload += "\n";
+                    data_payload += v;
+                }
+                if (eol == std::string::npos) break;
+                pos = eol + 1;
+            }
+
+            if (data_payload.empty()) continue;
+            if (data_payload == "[DONE]") continue;
+
+            if (!ctx->on_sse_event(data_payload)) {
+                ctx->aborted = true;
+                return 0; // abort transfer
+            }
+        }
+
+        return total;
     }
 
 private:
@@ -234,6 +295,49 @@ inline Response Session::makeRequest(const std::string& contentType) {
     return { response_string, is_error, error_msg };
 }
 
+inline Response Session::makeStreamRequest(std::function<bool(const std::string&)> on_sse_event,
+                                           const std::string& contentType) {
+    std::lock_guard<std::mutex> lock(mutex_request_);
+
+    struct curl_slist* headers = NULL;
+    if (!contentType.empty()) {
+        headers = curl_slist_append(headers, std::string{"Content-Type: " + contentType}.c_str());
+    }
+    headers = curl_slist_append(headers, std::string{"Authorization: Bearer " + token_}.c_str());
+    if (!organization_.empty()) {
+        headers = curl_slist_append(headers, std::string{"OpenAI-Organization: " + organization_}.c_str());
+    }
+    if (!beta_.empty()) {
+        headers = curl_slist_append(headers, std::string{"OpenAI-Beta: " + beta_}.c_str());
+    }
+    headers = curl_slist_append(headers, "Accept: text/event-stream");
+    curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl_, CURLOPT_URL, url_.c_str());
+
+    StreamCtx ctx;
+    ctx.on_sse_event = std::move(on_sse_event);
+
+    curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, writeStreamFunction);
+    curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &ctx);
+
+    res_ = curl_easy_perform(curl_);
+
+    bool is_error = false;
+    std::string error_msg{};
+    if (res_ != CURLE_OK && !ctx.aborted) {
+        is_error = true;
+        error_msg = "OpenAI curl_easy_perform() failed: " + std::string{curl_easy_strerror(res_)};
+        if (throw_exception_) {
+            throw std::runtime_error(error_msg);
+        }
+        else {
+            std::cerr << error_msg << '\n';
+        }
+    }
+
+    return { std::string{}, is_error, error_msg };
+}
+
 inline std::string Session::easyEscape(const std::string& text) {
     char *encoded_output = curl_easy_escape(curl_, text.c_str(), static_cast<int>(text.length()));
     const auto str = std::string{ encoded_output };
@@ -323,6 +427,10 @@ private:
 // Given a prompt, the model will return one or more predicted chat completions.
 struct CategoryChat {
     Json create(Json input);
+    // Streaming variant: sets "stream": true, calls on_chunk for every SSE event
+    // (with the parsed chunk JSON). Returning false from on_chunk aborts the stream.
+    // Returns a final aggregated JSON with the same shape as create() (choices[0].message.*).
+    Json createStream(Json input, std::function<bool(const Json&)> on_chunk);
 
     CategoryChat(OpenAI& openai) : openai_{openai} {}
 
@@ -513,6 +621,22 @@ public:
 
     Json post(const std::string& suffix, const Json& json, const std::string& contentType="application/json") {
         return post(suffix, json.dump(), contentType);
+    }
+
+    // Streaming POST: sends body, calls on_event for each SSE data payload (raw string).
+    // Return false from on_event to abort the stream.
+    void postStream(const std::string& suffix, const std::string& data,
+                    std::function<bool(const std::string&)> on_event,
+                    const std::string& contentType = "application/json") {
+        setParameters(suffix, data, contentType);
+        auto response = session_.makeStreamRequest(std::move(on_event), contentType);
+        if (response.is_error) { trigger_error(response.error_message); }
+    }
+
+    void postStream(const std::string& suffix, const Json& json,
+                    std::function<bool(const std::string&)> on_event,
+                    const std::string& contentType = "application/json") {
+        postStream(suffix, json.dump(), std::move(on_event), contentType);
     }
 
     Json del(const std::string& suffix) {
@@ -883,6 +1007,134 @@ inline Json CategoryCompletion::create(Json input) {
 // Creates a chat completion for the provided prompt and parameters
 inline Json CategoryChat::create(Json input) {
     return openai_.post("chat/completions", input);
+}
+
+// POST https://api.openai.com/v1/chat/completions with "stream": true.
+// Aggregates streamed deltas into a final JSON object with the same shape as create().
+inline Json CategoryChat::createStream(Json input, std::function<bool(const Json&)> on_chunk) {
+    input["stream"] = true;
+
+    // Aggregated final response (filled from deltas).
+    Json final_response = {
+        {"choices", Json::array({
+            Json{
+                {"index", 0},
+                {"message", {
+                    {"role", "assistant"},
+                    {"content", ""}
+                }},
+                {"finish_reason", nullptr}
+            }
+        })}
+    };
+    auto& agg_msg = final_response["choices"][0]["message"];
+    std::string content_acc;
+    std::string reasoning_acc;
+    // tool_calls aggregated by index
+    std::map<int, Json> tool_calls_by_index;
+    bool stream_error = false;
+    std::string stream_error_msg;
+
+    auto on_event = [&](const std::string& payload) -> bool {
+        Json chunk;
+        try {
+            chunk = Json::parse(payload);
+        } catch (...) {
+            return true; // ignore non-JSON payloads
+        }
+
+        // Server-side error reported mid-stream.
+        if (chunk.is_object() && chunk.contains("error")) {
+            stream_error = true;
+            try {
+                if (chunk["error"].is_object() && chunk["error"].contains("message")) {
+                    stream_error_msg = chunk["error"]["message"].get<std::string>();
+                } else {
+                    stream_error_msg = chunk["error"].dump();
+                }
+            } catch (...) {}
+            final_response["error"] = chunk["error"];
+            on_chunk(chunk);
+            return false;
+        }
+
+        if (!on_chunk(chunk)) return false;
+
+        if (!chunk.contains("choices") || !chunk["choices"].is_array() || chunk["choices"].empty()) {
+            return true;
+        }
+        const auto& choice = chunk["choices"][0];
+        if (choice.contains("finish_reason") && !choice["finish_reason"].is_null()) {
+            final_response["choices"][0]["finish_reason"] = choice["finish_reason"];
+        }
+        if (!choice.contains("delta") || !choice["delta"].is_object()) {
+            return true;
+        }
+        const auto& delta = choice["delta"];
+        if (delta.contains("role") && delta["role"].is_string()) {
+            agg_msg["role"] = delta["role"];
+        }
+        if (delta.contains("content") && delta["content"].is_string()) {
+            content_acc += delta["content"].get<std::string>();
+        }
+        if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string()) {
+            reasoning_acc += delta["reasoning_content"].get<std::string>();
+        }
+        if (delta.contains("annotations") && delta["annotations"].is_array()) {
+            agg_msg["annotations"] = delta["annotations"];
+        }
+        if (delta.contains("tool_calls") && delta["tool_calls"].is_array()) {
+            for (const auto& tc : delta["tool_calls"]) {
+                int idx = tc.contains("index") && tc["index"].is_number_integer()
+                              ? tc["index"].get<int>()
+                              : (int)tool_calls_by_index.size();
+                auto& acc = tool_calls_by_index[idx];
+                if (acc.is_null()) {
+                    acc = Json::object();
+                    acc["type"] = "function";
+                    acc["function"] = Json::object();
+                    acc["function"]["name"] = "";
+                    acc["function"]["arguments"] = "";
+                }
+                if (tc.contains("id") && tc["id"].is_string()) {
+                    acc["id"] = tc["id"];
+                }
+                if (tc.contains("type") && tc["type"].is_string()) {
+                    acc["type"] = tc["type"];
+                }
+                if (tc.contains("function") && tc["function"].is_object()) {
+                    const auto& f = tc["function"];
+                    if (f.contains("name") && f["name"].is_string()) {
+                        acc["function"]["name"] = acc["function"]["name"].get<std::string>()
+                                                  + f["name"].get<std::string>();
+                    }
+                    if (f.contains("arguments") && f["arguments"].is_string()) {
+                        acc["function"]["arguments"] = acc["function"]["arguments"].get<std::string>()
+                                                       + f["arguments"].get<std::string>();
+                    }
+                }
+            }
+        }
+        return true;
+    };
+
+    openai_.postStream("chat/completions", input, on_event);
+
+    agg_msg["content"] = content_acc;
+    if (!reasoning_acc.empty()) {
+        agg_msg["reasoning_content"] = reasoning_acc;
+    }
+    if (!tool_calls_by_index.empty()) {
+        Json arr = Json::array();
+        for (auto& kv : tool_calls_by_index) {
+            arr.push_back(kv.second);
+        }
+        agg_msg["tool_calls"] = arr;
+    }
+    if (stream_error && !final_response.contains("error")) {
+        final_response["error"] = { {"message", stream_error_msg} };
+    }
+    return final_response;
 }
 
 // POST https://api.openai.com/v1/audio/transcriptions

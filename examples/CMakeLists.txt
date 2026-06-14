@@ -38,6 +38,7 @@ set (SOURCES_EXAMPLES
     10-chat
     11-audio
     12-moderation
+    13-chat-stream
 )
 
 set (TARGETS_EXAMPLES
@@ -53,6 +54,7 @@ set (TARGETS_EXAMPLES
     10-chat
     11-audio
     12-moderation
+    13-chat-stream
 )
 
 foreach( name ${TARGETS_EXAMPLES} )
